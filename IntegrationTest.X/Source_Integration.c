@@ -38,6 +38,13 @@ char displaystuff[20];              //Hold message to be displayed
 /*----------HEART RATE MONITOR------*/
 int timeroverflow=0;
 int heartrate_final=0;
+
+
+/*----------HRV --------------------*/
+int HRVtimer0=0;
+float varipercent=0;
+
+
 /*---------TEMPERATURE------------------*/
 unsigned char MSB=0;
 unsigned char LSB=0;
@@ -78,6 +85,9 @@ void Glucose_ROM(void);
 /*-----------HEART RATE VARIABLITY----*/
 void HRV(void);
 void HRV_init(void);
+void HRV_startup(void);
+void HRV_process(void);
+void HRV_display(void);
 void HRV_ROM(void);
 
 /*-----------TEMPERATURE------------*/
@@ -124,6 +134,7 @@ void high_ISR(void){
         CloseTimer0();                   //Disable timer0
         CloseTimer1();                   //Disable timer1
         timeroverflow=1;
+        HRVtimer0=1;
         return;
     }
     //INTCON3bits.INT1IE = 1;
@@ -557,6 +568,7 @@ void HeartRate_countdown()
     Delay10KTCYx(100L);              //Wait one second
     putrsXLCD("00 ");
     
+    
     return; 
 }
 
@@ -691,11 +703,6 @@ void Speaker_high()
   
 }
 
-void Flash_home()
-{
-    return;
-}
-
 /*------------GLUCOSE------------------*/
 void Glucose()
 {
@@ -720,6 +727,10 @@ void HRV()
     Delay1TCY();
     HRV_startup();
     Delay1TCY();
+    HRV_process();
+    Delay1TCY();
+    HRV_display();
+    Delay1TCY();
     HRV_ROM();
     Delay1TCY();
     return;    
@@ -728,22 +739,46 @@ void HRV()
 
 void HRV_init()
 {
-    CloseTimer3();                 //Disable timer1   
-    T3CONbits.RD16=1;           // Enables register Read/Write of Timer1 in one 16-bit operation
-    T3CONbits.T3CCP2=1;         //Timer3 is the clock source for compare/capture CCP modules
-    T3CONbits.T3CCP1=1;
-    T3CONbits.T3CKPS1=0;          // 1:1 Prescale value
-    T3CONbits.T3CKPS0=0;
-    T3CONbits.T3SYNC=1;         //Do not synchronize external clock input
-    T3CONbits.TMR3CS=0;         // Internal clock (FOSC/4)
-    WriteTimer3(0);                 //Write 0 into the timer 1
+    /*Configure Timer 1 counter mode*/
+    CloseTimer1();                 //Disable timer1   
+    T1CONbits.RD16=1;           // Enables register Read/Write of Timer1 in one 16-bit operation
+    T1CONbits.TMR1CS=1;         //Timer1 increments on every rising edge of the external clock
+    T1CONbits.T1CKPS1=0;          // 1:1 Prescale value
+    T1CONbits.T1CKPS0=0;
+    T1CONbits.T1OSCEN=0;            //Timer1 Oscillator is shut-off
+    T1CONbits.T1SYNC=1;         //Do not synchronize external clock input
+    WriteTimer1(0);                 //Write 0 into the timer 1
+    
+    /*Configure Timer 0 timer mode*/
+    CloseTimer0();                   //Disable timer0
+    T0CONbits.T08BIT=0;               //Timer0 is configured as a 16-bit timer/counter
+    T0CONbits.T0CS=1; // Transition on T0CKI pin
+    T0CONbits.T0SE=0;     //Increment on low-to-high transition on T0CKI pin
+    T0CONbits.PSA=0;// Timer0 prescaler is assigned. Timer0 clock input comes from prescaler output.
+    T0CONbits.T0PS2=1;            //Timer0 Prescaler Select bits
+    T0CONbits.T0PS1=1;
+    T0CONbits.T0PS0=1;         //1:256 prescale value
+    WriteTimer0(6941);                 //Write 6941 into the timer 0
     
     /*Configure Interrupts*/
-    PIE2.TMR3IE=0;                          //Disables the TMR3 overflow interrupt 
-    PIR2.TMR3IF=0;                         //TMR3 register overflow low
-    IPR1.CCP1IP=1;                          //CCP1 Interrupt Priority bit
+    INTCON2bits.TMR0IP=1;                     // TMR0 Overflow Interrupt High Priority 
+    INTCONbits.TMR0IF=0;                     //TImer0 interrupt flag clear
+    INTCONbits.TMR0IE=1;        //Enables the TMR0 overflow interrupt    
     
-   
+//    CloseTimer3();                 //Disable timer1   
+//    T3CONbits.RD16=1;           // Enables register Read/Write of Timer1 in one 16-bit operation
+//    T3CONbits.T3CCP2=1;         //Timer3 is the clock source for compare/capture CCP modules
+//    T3CONbits.T3CCP1=1;
+//    T3CONbits.T3CKPS1=0;          // 1:1 Prescale value
+//    T3CONbits.T3CKPS0=0;
+//    T3CONbits.T3SYNC=1;         //Do not synchronize external clock input
+//    T3CONbits.TMR3CS=0;         // Internal clock (FOSC/4)
+//    WriteTimer3(0);                 //Write 0 into the timer 1
+//    
+//    /*Configure Interrupts*/
+//    PIE2.TMR3IE=0;                          //Disables the TMR3 overflow interrupt 
+//    PIR2.TMR3IF=0;                         //TMR3 register overflow low
+//    IPR1.CCP1IP=1;                          //CCP1 Interrupt Priority bit
     
   
 }
@@ -782,9 +817,129 @@ void HRV_startup()
     putrsXLCD("1");     
     Delay10KTCYx(100L);              //Wait one second
     
+    
+    
     return;    
 }
 
+void HRV_process()
+{
+    int t1ref=0;           //timer 1 counter set 0
+    int t0oldreg=6941;      //default value of timer 0
+    int t0newreg=0;         //new value of timer 0
+    int diff1=0;               //difference between first heart pulse
+    int diff2=0;               //difference between second heart pulse
+    int diffdiff=0;
+    int varival=0;
+    int varitotalcount=1;           //total number of samples
+    
+    while(BusyXLCD());              // Wait if LCD busy
+    WriteCmdXLCD(0x01); // Clears all display and returns the cursor to the home position (Address 0).
+    while(BusyXLCD());
+    Delay1KTCYx(110); //Give time for LCD to refresh, writing to it too quickly causes flicker issues
+    while(BusyXLCD());
+    putrsXLCD("Please wait...");
+    
+    
+    T0CONbits.TMR0ON=1;                           // Enables Timer0
+    T1CONbits.TMR1ON=1;                           // Enables Timer1
+    
+    
+    while (varitotalcount<15)        //while timer 0 has no overflowed
+    {
+        
+        if(t1ref!=ReadTimer1())       //if there has been an rising edge on timer1 pin
+        {
+            varitotalcount++;           //increment total number of variability counts
+            t1ref=ReadTimer1();        //set timer1 reference to timer 1 count val
+            
+            t0newreg=ReadTimer0();          //place time of timer0 to time register
+
+            if (varitotalcount==1)
+            {
+                diff1=t0newreg-t0oldreg;          //difference between rising edges          
+            }
+            else
+            {
+                diff2=t0newreg-t0oldreg;          //difference between rising edges
+                if (diff2>diff1)                    //if first 
+                {
+                    diffdiff=diff2-diff1;
+                    if(diffdiff>195)
+                    {
+                        varival++;         
+                    }
+                }
+                else
+                {
+                   diffdiff=diff1-diff2; 
+                   if(diffdiff>195)
+                   {
+                       varival++;         
+                   }
+                }
+            }
+            t0oldreg=t0newreg;
+        }
+        
+    }
+ 
+    varipercent = (varival/varitotalcount)*100;
+    
+    while(BusyXLCD());              // Wait if LCD busy
+    WriteCmdXLCD(0x01); // Clears all display and returns the cursor to the home position (Address 0).
+    while(BusyXLCD());
+    Delay1KTCYx(110); //Give time for LCD to refresh, writing to it too quickly causes flicker issues
+    while(BusyXLCD());
+    putrsXLCD("pass");
+    
+}
+
+void HRV_display()
+{
+    char hrv_out[10];
+    sprintf(hrv_out,"%i %",varipercent=0);
+    
+    while(BusyXLCD());              // Wait if LCD busy
+    WriteCmdXLCD(0x01); // Clears all display and returns the cursor to the home position (Address 0).
+    while(BusyXLCD());
+    Delay1KTCYx(110); //Give time for LCD to refresh, writing to it too quickly causes flicker issues
+    while(BusyXLCD());
+    putrsXLCD("Your HRV is");
+
+    while(BusyXLCD());
+    SetDDRamAddr(0x40);         //Set cursor to second line
+    while(BusyXLCD());
+    Delay1KTCYx(110); //Give time for LCD to refresh, writing to it too quickly causes flicker issues
+    putsXLCD(hrv_out);
+    
+    if (varipercent>25)
+    {
+        while(BusyXLCD());
+        SetDDRamAddr(0x14);         //Set cursor to third line
+        while(BusyXLCD());
+        Delay1KTCYx(110); //Give time for LCD to refresh, writing to it too quickly causes flicker issues
+        putrsXLCD("HRV is TOO HIGH!!!");
+        Speaker_high();
+        return;
+    }
+    else
+    {
+        while(BusyXLCD());
+        SetDDRamAddr(0x14);         //Set cursor to third line
+        while(BusyXLCD());
+        Delay1KTCYx(110); //Give time for LCD to refresh, writing to it too quickly causes flicker issues
+        putrsXLCD("HRV is good");
+        Delay10KTCYx(200L);              //Wait two second
+        Delay10KTCYx(200L);              //Wait two second
+        Delay10KTCYx(100L);              //Wait one second
+        return;
+    }
+    return;
+}
+
+
+/*
 void HeartRate_countdown()
 {
     int oldreg=0;
@@ -879,7 +1034,7 @@ void HeartRate_countdown()
     
     return; 
 }
-
+*/
 
 void HRV_ROM()
 {
@@ -1025,6 +1180,19 @@ void Temp_display()
     return;
 }
 
+void Flash_home(void)
+{
+    while(BusyXLCD());              // Wait if LCD busy
+    WriteCmdXLCD(0x01); // Clears all display and returns the cursor to the home position (Address 0).
+    while(BusyXLCD());
+    Delay1KTCYx(110); //Give time for LCD to refresh, writing to it too quickly causes flicker issues
+    while(BusyXLCD());
+    putrsXLCD("Coming soon...");
+    Delay10KTCYx(200L);              //Wait two second
+    Delay10KTCYx(100L);              //Wait one second
+
+    return;
+}
 
 
 
